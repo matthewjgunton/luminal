@@ -18,8 +18,12 @@ pub fn load<M: SerializeModule>(path: &str, model: &M, graph: &mut Graph) {
                 let file = File::open(&path).unwrap();
                 let mmap = unsafe { Mmap::map(&file).unwrap() };
                 let safetensors = SafeTensors::deserialize(&mmap).unwrap();
+                // println!("Looking for tensor name: {}", weight_name.replace('/', "."));
+                // println!("All keys: {:?}", safetensors.names());
 
                 if let Ok(tensor_view) = safetensors.tensor(&weight_name.replace('/', ".")) {
+                    // println!("Shape of tensor: {:?}", tensor_view.shape());
+                    // println!("Assigning tensor {weight_name} to node index {node_index:?}");
                     let data: Vec<f32> = match tensor_view.dtype() {
                         Dtype::F32 => tensor_view
                             .data()
@@ -33,6 +37,11 @@ pub fn load<M: SerializeModule>(path: &str, model: &M, graph: &mut Graph) {
                             .collect(),
                         _ => panic!("{:?} is not a supported dtype", tensor_view.dtype()),
                     };
+                    // if weight_name.replace('/', ".") == "model.vision.patch_emb.weight" {
+                    //     // print first row (VIS_DIM entries) and first 10 values of that row
+                    //     let row0 = &data[0..1152];
+                    //     println!("[debug] first row.len={} → {:?}", row0.len(), &row0[..10]);
+                    // }
                     return vec![Tensor::new(data)];
                 }
 

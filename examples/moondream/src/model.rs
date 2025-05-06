@@ -5,27 +5,30 @@ use luminal::prelude::{binary::F32Pow, *};
 use luminal_nn::{Conv2D, Embedding, LayerNorm, Linear};
 
 ////////////////////////////////////////////////////////////////
-// Model‑wide constants – taken from moondream/torch/config.py //
+// Model‑wide constants – taken from https://huggingface.co/vikhyatk/moondream2/blob/main/config.py //
 ////////////////////////////////////////////////////////////////
 
 // —— Text (“GPT”) tower ——
 pub const TXT_DIM: usize = 2048;
 pub const TXT_FF_DIM: usize = 8192;
-pub const TXT_N_LAYERS: usize = 24;
+pub const TXT_N_LAYERS: usize = 1;
 pub const TXT_VOCAB: usize = 51_200;
 pub const TXT_MAX_CTX: usize = 2048;
-pub const TXT_N_HEADS: usize = 32;
+pub const TXT_N_HEADS: usize = 16;
 pub const TXT_N_KV: usize = 32;
+pub const TXT_PREFIX_ATTN: usize = 730;
 
 // —— Vision encoder ——
 pub const VIS_DIM: usize = 1152;
 pub const VIS_PATCH: usize = 14;
-pub const VIS_LAYERS: usize = 27;
+pub const VIS_LAYERS: usize = 1;
 pub const VIS_FF_DIM: usize = 4304;
 pub const VIS_HEADS: usize = 16;
-pub const VIS_CROP: usize = 378;
-pub const VIS_MAX_CROPS: usize = 12;
 pub const VIS_PROJ_DIM: usize = 2048;
+pub const VIS_CROP: usize = 378;
+pub const VIS_IN_CHANNELS: usize = 3;
+pub const VIS_MAX_CROPS: usize = 12;
+pub const VIS_OVERLAP_MARGIN: usize = 4;
 pub const VIS_PROJ_INNER: usize = 8192;
 
 // —— Region head ——
@@ -37,24 +40,29 @@ pub const REG_SIZE_OUT: usize = 2048;
 pub const REG_INNER: usize = 8192;
 
 //////////////////////////////////////////////////////
-// Helper: rotary embedding for single‑precision FFT //
+// Helper: rotary embedding for single‑precision FFT from https://huggingface.co/vikhyatk/moondream2/blob/main/rope.py //
 //////////////////////////////////////////////////////
 
-fn apply_rotary_embeddings(t: GraphTensor, pos: Expression) -> GraphTensor {
-    let (b, h, s, d) = t.dims4();
-    let freqs = (t.graph().arange(d / 2) * 2.0) / (d.to_usize().unwrap() as f32);
-    let freqs = 500_000_f32.pow(freqs); // θ_i = 500k^(-2i/d)
-    let pos = t.graph().arange(s) + pos; // absolute positions
+fn apply_rotary_embeddings(input: GraphTensor, prev_seq: Expression) -> GraphTensor {
+    assert_eq!(input.shape.len(), 4); // batch, n_heads, seq, head_dim
+    let (batch, n_heads, seq, head_dim) = input.dims4();
+    // Get freqs
+    let freqs = (input.graph().arange(head_dim / 2) * 2.0) / (head_dim.to_usize().unwrap() as f32);
+    let freqs = 10_000_f32.pow(freqs);
+    let pos = input.graph().arange(seq) + prev_seq;
     let emb = pos.expand(1, 1).matmul(freqs.expand(0, 1));
 
-    let split = t.reshape((b, h, s, d / 2, 2));
+    // Split input into evens and odds
+    let split = input.reshape((batch, n_heads, seq, head_dim / 2, 2));
     let x0 = split.slice((.., .., .., .., ..1));
     let x1 = split.slice((.., .., .., .., 1..));
 
-    let out0 = x0 * emb.cos().expand_to(x0.shape) - x1 * emb.sin().expand_to(x1.shape);
-    let out1 = x0 * emb.sin().expand_to(x0.shape) + x1 * emb.cos().expand_to(x1.shape);
+    // Apply sin and cos embeddings
+    let x0_out = x0 * emb.cos().expand_to(x0.shape) - x1 * emb.sin().expand_to(x1.shape);
+    let x1_out = x0 * emb.sin().expand_to(x0.shape) + x1 * emb.cos().expand_to(x1.shape);
 
-    out0.concat_along(out1, 4).reshape(t.shape)
+    // Combine back into output
+    x0_out.concat_along(x1_out, 4).reshape(input.shape)
 }
 
 /////////////////////////////
@@ -68,23 +76,13 @@ pub struct PatchEmbed {
 impl PatchEmbed {
     pub fn new(cx: &mut Graph) -> Self {
         Self {
-            lin: Linear::new_permuted(PATCH_DIM, VIS_DIM, false, cx),
+            lin: Linear::new(PATCH_DIM, VIS_DIM, true, cx),
         }
     }
 }
 impl Module<GraphTensor> for PatchEmbed {
     type Output = GraphTensor; // (B,‑,1152)
     fn forward(&self, x: GraphTensor) -> GraphTensor {
-        // x : (B,C,H,W)  with H=W=378
-        let (b, c, h, w) = x.dims4();
-        let p = VIS_PATCH; // 14
-                           // Step‑1: B C H/P P W/P P
-        let x = x
-            .reshape((b, c, h / p, p, w / p, p))
-            // Step‑2: B H/P W/P C P P
-            .permute((0, 2, 4, 1, 3, 5))
-            // Step‑3: B N 588   where N = 27×27 = 729
-            .reshape((b, (h / p) * (w / p), PATCH_DIM));
         self.lin.forward(x) // (B,729,1152)
     }
 }
@@ -109,6 +107,7 @@ impl ViTBlock {
         }
     }
 }
+
 impl Module<GraphTensor> for ViTBlock {
     type Output = GraphTensor;
     fn forward(&self, mut x: GraphTensor) -> GraphTensor {
@@ -151,12 +150,30 @@ impl VisionEncoder {
 impl Module<GraphTensor> for VisionEncoder {
     type Output = GraphTensor; // (b, n_tokens, VIS_DIM)
     fn forward(&self, x: GraphTensor) -> Self::Output {
-        let mut t = self.patch.forward(x);
+        // patch embedding first
+        let (b, c, hp1, wp2) = x.dims4();
+        let p = VIS_PATCH;
+        let h = hp1 / p;
+        let w = wp2 / p;
+        let mut t = x
+            .reshape((b, c, h, p, w, p))
+            .permute((0, 2, 4, 1, 3, 5))
+            .reshape((b, h * w, c * p * p));
+        x.diff("./bins/before_encoder.bin", 1e-5);
+
+        // then applying the model to it here
+        let mut xs = self.patch.forward(t);
+        xs.diff("./bins/patch_embed.bin", 1e-5);
+        xs = xs + self.pos;
+        // xs.diff("./bins/pos_embed_addition.bin", 1e-5);
+
+        // finally the forward layer
         t = t.concat_along(self.pos.slice((.., ..1, ..)), 1); // prepend CLS
         t += self.pos.slice((.., 1.., ..)); // add patch pos
         for blk in &self.blks {
             t = blk.forward(t);
         }
+        // t.diff("./bins/after_encoder.bin", 1e-5);
         t
     }
 }
@@ -181,9 +198,9 @@ impl Module<GraphTensor> for VisionProjection {
     type Output = GraphTensor;
     fn forward(&self, vis: GraphTensor) -> GraphTensor {
         let (b, n, _) = vis.dims3(); // n == 729
-        let g = vis.slice((.., ..1, ..)).expand_to((b, n, VIS_DIM));
+        let g = vis.slice((.., ..1, ..));
         let grid = vis.slice((.., 1.., ..));
-        let feats = g.concat_along(grid, 2); // (b,729,2304)
+        let feats = g.contiguous().concat_along(grid.contiguous(), 2); // (b,729,2304)
         self.fc2.forward(self.fc1.forward(feats).swish())
     }
 }
@@ -271,11 +288,17 @@ impl Module<(GraphTensor, KVCache)> for SelfAttention {
             .slice((.., .., TXT_N_HEADS + TXT_N_KV.., ..))
             .permute((0, 2, 1, 3)); // (B,Hkv,S,d)
 
+        // q.diff("./bins/q.bin", 1e-4);
+        // k.diff("./bins/k.bin", 1e-4);
+
         // rotary & cache
         let q = apply_rotary_embeddings(q, p);
         let k = apply_rotary_embeddings(k, p);
         let k = k_cache.concat_along(k, 2);
         let v = v_cache.concat_along(v, 2);
+
+        // q.diff("./bins/q_rot.bin", 1e-4);
+        // k.diff("./bins/k_rot.bin", 1e-4);
 
         // attention
         let att = q.matmul(k.permute((0, 1, 3, 2))) / (head_dim as f32).sqrt();
@@ -355,6 +378,7 @@ pub struct Moondream {
     txt_norm: LayerNorm,
     lm_head: Linear,
 }
+
 impl Moondream {
     pub fn new(cx: &mut Graph) -> Self {
         Self {
@@ -374,12 +398,16 @@ impl Module<(GraphTensor, GraphTensor, &[KVCache])> for Moondream {
     type Output = (GraphTensor, Vec<KVCache>);
     fn forward(&self, (img, toks, cache): (GraphTensor, GraphTensor, &[KVCache])) -> Self::Output {
         // Vision → prefix tokens
+        img.diff("./bins/image_encoder_input.bin", 1e-4); //MATCHED
         let vis_tokens = self.vision.forward(img); // (b,n_vis,VIS_DIM)
+                                                   // vis_tokens.diff("./bins/image_encoder.bin", 1e-4);
+
         let prefix = self.vis_proj.forward(vis_tokens); // (b,prefix,TXT_DIM)
 
         // Text embedding
         let mut x = self.embed.forward(toks); // (b,seq,TXT_DIM)
         x = prefix.concat_along(x, 1); // prepend vision prefix
+                                       // x.diff("./bins/embeddings.bin", 1e-4);
 
         // Transformer
         let mut new = Vec::with_capacity(TXT_N_LAYERS);

@@ -1,6 +1,8 @@
 use std::{
+    env,
     fs::File,
     io::{self, Read, Write},
+    path::Path,
     time::Instant,
 };
 
@@ -9,6 +11,8 @@ use colored::Colorize;
 use itertools::Itertools;
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
+
+use image::{DynamicImage, GenericImageView, ImageBuffer};
 
 mod loader;
 mod model;
@@ -25,8 +29,47 @@ pub struct CLIArgs {
     gen_tokens: i32,
 
     /// Prompt for the model
-    #[clap(short = 'p', long = "prompt", default_value = include_str!("../prompts/merge_sort.txt"))]
+    #[clap(short = 'p', long = "prompt", default_value = include_str!("../prompts/test.txt"))]
     prompt: String,
+}
+
+/**
+ * need to modify this so that the data is pulled correctly here
+ *
+ */
+pub fn load_image<P: AsRef<std::path::Path>>(
+    p: P,
+    cx: &mut Graph,
+) -> Result<GraphTensor, Box<dyn std::error::Error>> {
+    // load & resize
+    let img = image::ImageReader::open(p)?
+        .decode()?
+        .resize_to_fill(378, 378, image::imageops::FilterType::Triangle)
+        .to_rgb8();
+    let data_u8 = img.into_raw();
+
+    // do (x/255 − .5)/.5 in plain Rust, and guard against any NaN
+    let data_norm: Vec<f32> = data_u8
+        .iter()
+        .map(|&v| {
+            let x = (v as f32) / 255.0;
+            let y = (x - 0.5) / 0.5;
+            // just in case:
+            if y.is_nan() {
+                -1.0
+            } else {
+                y
+            }
+        })
+        .collect();
+
+    // now build your graph tensor already normalized
+    let out = cx
+        .tensor((1, 378, 378, 3))
+        .set(data_norm)
+        .permute((0, 3, 1, 2));
+
+    Ok(out)
 }
 
 fn main() {
@@ -63,7 +106,10 @@ fn main() {
     let model = model::Moondream::new(&mut cx);
     let mut model_weights = params(&model);
     cx.keep_tensors(&model_weights);
-    let img = cx.constant(0).expand_to((1, 64, 64, model::VIS_DIM));
+
+    let img = load_image("example.jpg", &mut cx).unwrap();
+    img.diff("./bins/image.bin", 1e-5);
+
     let (logits, mut cache_dest) = model.forward((img, input, &cache_src));
     let mut logits = logits
         .slice((.., Expression::from('s') - 1.., ..))
@@ -152,41 +198,41 @@ fn main() {
     transfer_data_same_graph(&cache_dest, &cache_src, &mut cx);
 
     // Decode loop
-    let start_decode = std::time::Instant::now();
-    let mut prev_output_len = initial.len();
-    for _ in 0..cli_args.gen_tokens {
-        input.set_dyn(vec![*output_ids.last().unwrap() as f32], (1, 1));
-        cx.set_dyn_dim('p', input_ids.len() + output_ids.len() - 1);
-        cx.execute();
+    // let start_decode = std::time::Instant::now();
+    // let mut prev_output_len = initial.len();
+    // for _ in 0..cli_args.gen_tokens {
+    //     input.set_dyn(vec![*output_ids.last().unwrap() as f32], (1, 1));
+    //     cx.set_dyn_dim('p', input_ids.len() + output_ids.len() - 1);
+    //     cx.execute();
 
-        // Sample tokens
-        let output_id = argmax(&logits.data());
-        logits.drop();
-        output_ids.push(output_id);
-        println!("ID: {}", output_id);
+    //     // Sample tokens
+    //     let output_id = argmax(&logits.data());
+    //     logits.drop();
+    //     output_ids.push(output_id);
+    //     println!("ID: {}", output_id);
 
-        // Get the current decoded output
-        let current_output = tokenizer.decode(&output_ids, false).unwrap();
+    //     // Get the current decoded output
+    //     let current_output = tokenizer.decode(&output_ids, false).unwrap();
 
-        // Print the new substring added to the decoded output
-        print!("{}", current_output[prev_output_len..].bright_green());
-        io::stdout().flush().unwrap();
+    //     // Print the new substring added to the decoded output
+    //     print!("{}", current_output[prev_output_len..].bright_green());
+    //     io::stdout().flush().unwrap();
 
-        // Update the previous output
-        prev_output_len = current_output.len();
+    //     // Update the previous output
+    //     prev_output_len = current_output.len();
 
-        // Swap caches
-        transfer_data_same_graph(&cache_dest, &cache_src, &mut cx);
-    }
+    //     // Swap caches
+    //     transfer_data_same_graph(&cache_dest, &cache_src, &mut cx);
+    // }
 
-    println!();
-    let avg_token_time =
-        start_decode.elapsed().as_micros() as f32 / (output_ids.len() - 1) as f32 / 1000.0;
-    println!(
-        "\nAverage token generated in {:.2}ms\t - ({:.2} tok/s)",
-        avg_token_time,
-        1000.0 / avg_token_time
-    );
+    // println!();
+    // let avg_token_time =
+    //     start_decode.elapsed().as_micros() as f32 / (output_ids.len() - 1) as f32 / 1000.0;
+    // println!(
+    //     "\nAverage token generated in {:.2}ms\t - ({:.2} tok/s)",
+    //     avg_token_time,
+    //     1000.0 / avg_token_time
+    // );
 }
 
 // Currently just an argmax, do actual sampling here
