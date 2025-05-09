@@ -110,92 +110,94 @@ fn main() {
     let img = load_image("example.jpg", &mut cx).unwrap();
     img.diff("./bins/image.bin", 1e-5);
 
-    let (logits, mut cache_dest) = model.forward((img, input, &cache_src));
-    let mut logits = logits
-        .slice((.., Expression::from('s') - 1.., ..))
-        .retrieve();
-    cache_dest.keep();
-    println!("\t\t - {}ms", now.elapsed().as_millis());
+    let (_, _) = model.forward((img, input, &cache_src));
 
-    print!("Compiling graph");
-    io::stdout().flush().unwrap();
-    let now = Instant::now();
+    // let (logits, mut cache_dest) = model.forward((img, input, &cache_src));
+    // let mut logits = logits
+    //     .slice((.., Expression::from('s') - 1.., ..))
+    //     .retrieve();
+    // cache_dest.keep();
+    // println!("\t\t - {}ms", now.elapsed().as_millis());
+
+    // print!("Compiling graph");
+    // io::stdout().flush().unwrap();
+    // let now = Instant::now();
 
     // Set up model loading
-    loader::load("setup/moondream2.safetensors", &model, &mut cx);
+    // loader::load("setup/moondream2.safetensors", &model, &mut cx);
 
-    cx.compile(
-        (
-            GenericCompiler::default(),
-            #[cfg(feature = "metal")]
-            luminal_metal::MetalCompiler::<f32>::default(),
-            #[cfg(feature = "cuda")]
-            (
-                luminal_cuda::CudaCompiler::<f16>::default(),
-                luminal_cuda::CudaQuantizedCompiler::<f16>::new(q_weights),
-            ),
-            #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
-            luminal_cpu::CPUCompiler::default(),
-        ),
-        (
-            &mut input,
-            &mut logits,
-            &mut cache_src,
-            &mut cache_dest,
-            &mut model_weights,
-        ),
-    );
-    let cache_src = downstream(&cache_src, &cx);
-    println!("\t\t - {}ms", now.elapsed().as_millis());
+    // cx.compile(
+    //     (
+    //         GenericCompiler::default(),
+    //         #[cfg(feature = "metal")]
+    //         luminal_metal::MetalCompiler::<f32>::default(),
+    //         #[cfg(feature = "cuda")]
+    //         (
+    //             luminal_cuda::CudaCompiler::<f16>::default(),
+    //             luminal_cuda::CudaQuantizedCompiler::<f16>::new(q_weights),
+    //         ),
+    //         #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
+    //         luminal_cpu::CPUCompiler::default(),
+    //     ),
+    //     (
+    //         &mut input,
+    //         &mut logits,
+    //         &mut cache_src,
+    //         &mut cache_dest,
+    //         &mut model_weights,
+    //     ),
+    // );
+    // let cache_src = downstream(&cache_src, &cx);
+    // println!("\t\t - {}ms", now.elapsed().as_millis());
 
     // Initial forward pass to load weights
-    print!("Loading model");
-    io::stdout().flush().unwrap();
-    let now = Instant::now();
-    input.set_dyn(vec![1.], (1, 1));
-    cx.set_dyn_dim('t', 1);
-    cx.execute();
-    logits.drop();
-    transfer_data_same_graph(&cache_dest, &cache_src, &mut cx);
-    println!("\t\t - {}ms", now.elapsed().as_millis());
+    // print!("Loading model");
+    // io::stdout().flush().unwrap();
+    // let now = Instant::now();
+    // input.set_dyn(vec![1.], (1, 1));
+    // cx.set_dyn_dim('t', 1);
+    // cx.execute();
+    // logits.drop();
+    // transfer_data_same_graph(&cache_dest, &cache_src, &mut cx);
+    // println!("\t\t - {}ms", now.elapsed().as_millis());
 
-    // Now that weights are loaded, delete the loading nodes so they don't run again
-    delete_inputs(&cache_src, &mut cx);
-    delete_inputs(downstream(model_weights, &cx), &mut cx);
+    // // Now that weights are loaded, delete the loading nodes so they don't run again
+    // delete_inputs(&cache_src, &mut cx);
+    // delete_inputs(downstream(model_weights, &cx), &mut cx);
 
-    // Run prompt processing pass
-    let input_ids = tokenizer
-        .encode(&cli_args.prompt as &str, false)
-        .unwrap()
-        .get_ids()
-        .to_vec();
-    input.set_dyn(
-        input_ids.iter().map(|i| *i as f32).collect::<Vec<_>>(),
-        (1, input_ids.len()),
-    );
-    cx.set_dyn_dim('t', input_ids.len());
-    print!("Processing Prompt");
-    io::stdout().flush().unwrap();
-    let now = Instant::now();
-    cx.execute();
-    let elapsed_ms = now.elapsed().as_millis();
-    println!(
-        "\t - {elapsed_ms}ms ({:.2} tok/s, {} prompt tokens)",
-        1000.0 * (input_ids.len() as f64) / (elapsed_ms as f64),
-        input_ids.len()
-    );
-    let mut output_ids = vec![argmax(&logits.data())];
-    println!("ID: {}", output_ids[0]);
-    logits.drop();
+    // // Run prompt processing pass
+    // let input_ids = tokenizer
+    //     .encode(&cli_args.prompt as &str, false)
+    //     .unwrap()
+    //     .get_ids()
+    //     .to_vec();
+    // input.set_dyn(
+    //     input_ids.iter().map(|i| *i as f32).collect::<Vec<_>>(),
+    //     (1, input_ids.len()),
+    // );
+    // cx.set_dyn_dim('t', input_ids.len());
+    // print!("Processing Prompt");
+    // io::stdout().flush().unwrap();
+    // let now = Instant::now();
+    // cx.execute();
+    // let elapsed_ms = now.elapsed().as_millis();
+    // println!(
+    //     "\t - {elapsed_ms}ms ({:.2} tok/s, {} prompt tokens)",
+    //     1000.0 * (input_ids.len() as f64) / (elapsed_ms as f64),
+    //     input_ids.len()
+    // );
+    // let mut output_ids = vec![argmax(&logits.data())];
+    // println!("ID: {}", output_ids[0]);
+    // logits.drop();
 
-    // Decode token
-    print!("{}", cli_args.prompt.white().bold());
-    let initial = tokenizer.decode(&output_ids, false).unwrap().bright_green();
-    print!("{initial}",);
-    io::stdout().flush().unwrap();
+    // // Decode token
+    // print!("{}", cli_args.prompt.white().bold());
+    // let initial = tokenizer.decode(&output_ids, false).unwrap().bright_green();
+    // print!("{initial}",);
+    // io::stdout().flush().unwrap();
 
-    // Swap caches
-    transfer_data_same_graph(&cache_dest, &cache_src, &mut cx);
+    // // Swap caches
+    // transfer_data_same_graph(&cache_dest, &cache_src, &mut cx);
 
     // Decode loop
     // let start_decode = std::time::Instant::now();
