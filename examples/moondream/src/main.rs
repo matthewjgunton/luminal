@@ -21,7 +21,10 @@ fn main() {
     print!("Defining graph");
     let mut cx = Graph::new();
 
-    let toks = cx.tensor((1, 9)).set(vec![1 as f32; 1 * 9]);
+    // let toks = cx.tensor((1, 9)).set(vec![1 as f32; 1 * 9]);
+    let toks = cx
+        .tensor((10, 3, 378, 378))
+        .set(vec![1 as f32; 10 * 3 * 378 * 378]);
     let mul = cx.tensor((1, 32, 9, 16)).set(vec![2 as f32; 1 * 4608]);
     let mu2 = cx.tensor((9, 16)).set(vec![2 as f32; 1 * 144]);
     let out = mul * mu2;

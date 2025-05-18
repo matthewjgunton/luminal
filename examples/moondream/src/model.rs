@@ -10,8 +10,172 @@ pub const TXT_N_KV: usize = 32;
 pub const TXT_FF_DIM: usize = 8192;
 
 pub const VIS_DIM: usize = 1152;
+pub const VIS_PATCH_SIZE: usize = 14;
+pub const VIS_PATCH_DIM: usize = VIS_PATCH_SIZE * VIS_PATCH_SIZE * 3; // 588
+pub const VIS_NUM_PATCHES: usize = 729;
+pub const VIS_FF_DIM: usize = 4304;
+pub const VIS_N_LAYERS: usize = 1; //27; keeping it truly simple for now
+pub const VIS_ENC_N_HEADS: usize = 16;
+pub const VIS_HEAD_DIM: usize = VIS_DIM / VIS_ENC_N_HEADS;
 
-pub const DIFF_THRESHOLD: f32 = 1e-2;
+// guessing: (1) redo attention for encoding head as parameter
+
+pub const DIFF_THRESHOLD: f32 = 1e-4;
+
+pub struct VisionAttention {
+    qkv: Linear,
+    proj: Linear,
+}
+impl VisionAttention {
+    pub fn new(cx: &mut Graph) -> Self {
+        Self {
+            qkv: Linear::new_permuted(VIS_DIM, VIS_DIM * 3, true, cx), // shape here is up for debate
+            proj: Linear::new_permuted(VIS_DIM, VIS_DIM, true, cx), // shape here is up for debate
+        }
+    }
+}
+// like text but no mask & no rotary pos
+impl Module<GraphTensor> for VisionAttention {
+    type Output = GraphTensor; // (b, n_tokens, VIS_DIM)
+    fn forward(&self, x: GraphTensor) -> Self::Output {
+        let (bsz, q_len, d_model) = x.dims3();
+        let head_dim = d_model / VIS_ENC_N_HEADS;
+
+        let qkv = self.qkv.forward(x);
+        let q = qkv
+            .slice((.., .., ..Expression::from(VIS_DIM)))
+            .reshape((bsz, q_len, VIS_ENC_N_HEADS, head_dim))
+            .permute((0, 2, 1, 3))
+            .contiguous();
+        let k = qkv
+            .slice((
+                ..,
+                ..,
+                Expression::from(VIS_DIM)..Expression::from(2 * VIS_DIM),
+            ))
+            .reshape((bsz, q_len, VIS_ENC_N_HEADS, head_dim))
+            .permute((0, 2, 1, 3))
+            .contiguous();
+        let v = qkv
+            .slice((
+                ..,
+                ..,
+                Expression::from(2 * VIS_DIM)..Expression::from(3 * VIS_DIM),
+            ))
+            .reshape((bsz, q_len, VIS_ENC_N_HEADS, head_dim))
+            .permute((0, 2, 1, 3))
+            .contiguous();
+
+        let mut att = q.matmul(k.permute((0, 1, 3, 2))); // dims are right, this is likely correct
+
+        let sqrt_dk = (VIS_HEAD_DIM as f32).sqrt();
+        att = att * (1.0 / sqrt_dk);
+        att = att.softmax(3);
+        println!("A: {:?}\nV: {:?}", att.dims(), v.dims());
+
+        let out = att
+            .matmul(v)
+            .permute((0, 2, 1, 3))
+            .reshape((bsz, q_len, d_model));
+
+        (self.proj.forward(out))
+    }
+}
+
+pub struct VisionBlock {
+    ln1: LayerNorm,
+    ln2: LayerNorm,
+    attn: VisionAttention,
+    mlp: Mlp,
+}
+impl VisionBlock {
+    pub fn new(cx: &mut Graph) -> Self {
+        Self {
+            ln1: LayerNorm::new(VIS_DIM, true, true, true, 1e-5, cx),
+            ln2: LayerNorm::new(VIS_DIM, true, true, true, 1e-5, cx),
+            attn: VisionAttention::new(cx),
+            mlp: Mlp::new_with_bias(VIS_DIM, VIS_FF_DIM, cx),
+        }
+    }
+}
+
+impl Module<GraphTensor> for VisionBlock {
+    type Output = GraphTensor; // (b, n_tokens, VIS_DIM)
+    fn forward(&self, mut x: GraphTensor) -> Self::Output {
+        let ln_x1 = self.ln1.forward(x);
+        // make a key value cache maybe?
+        let l_attn = self.attn.forward(ln_x1);
+        x = x + l_attn;
+
+        x.diff("./bins/block_mid.bin", DIFF_THRESHOLD);
+
+        let ln_x2 = self.ln2.forward(x);
+        x = x + self.mlp.forward(ln_x2);
+
+        x.diff("./bins/block_end.bin", DIFF_THRESHOLD); // broken
+        x
+    }
+}
+
+fn create_patches(mut x: GraphTensor) -> GraphTensor {
+    let (b, c, h, w) = x.dims4();
+    let p1 = VIS_PATCH_SIZE;
+
+    // Step 1: Split H and W dimensions into patches
+    //[B, C, H/P1, P1, W/P2, P2]
+    x = x.reshape((b, c, h / p1, p1, w / p1, p1));
+    // x = x.reshape(B, C, H // P1, P1, W // P2, P2)
+
+    // # Step 2: Rearrange dimensions to match target shape
+    // # [B, H/P1, W/P2, C, P1, P2]
+    x = x.permute((0, 2, 4, 1, 3, 5));
+
+    // # Step 3: Combine dimensions to get final shape
+    // # [B, (H/P1)*(W/P2), C*P1*P2]
+    x = x.reshape((b, (h / p1) * (w / p1), c * p1 * p1));
+
+    x
+}
+pub struct VisionEncoder {
+    linear: Linear,
+    pos_emb: GraphTensor,
+    blocks: Vec<VisionBlock>,
+    ln: LayerNorm,
+}
+impl VisionEncoder {
+    pub fn new(cx: &mut Graph) -> Self {
+        Self {
+            linear: Linear::new_permuted(VIS_PATCH_DIM, VIS_DIM, true, cx),
+            pos_emb: cx
+                .named_tensor("pos_emb", (VIS_NUM_PATCHES, VIS_DIM))
+                .expand(0, 1),
+            blocks: (0..VIS_N_LAYERS).map(|_| VisionBlock::new(cx)).collect(),
+            ln: LayerNorm::new(VIS_DIM, true, true, true, 1e-5, cx),
+        }
+    }
+}
+impl Module<GraphTensor> for VisionEncoder {
+    type Output = GraphTensor;
+    fn forward(&self, img: GraphTensor) -> Self::Output {
+        let mut x = create_patches(img);
+        x.diff("./bins/create_patches.bin", DIFF_THRESHOLD);
+        x = self.linear.forward(x);
+        x.diff("./bins/linear.bin", DIFF_THRESHOLD);
+        self.pos_emb.diff("./bins/wpos_emb.bin", DIFF_THRESHOLD);
+        println!("{:?} + {:?}", self.pos_emb.dims(), x.dims());
+        x = x + self.pos_emb; // source of NaN
+        println!("= {:?}", x.dims());
+        x.diff("./bins/pos_emb.bin", DIFF_THRESHOLD);
+
+        for layer in 0..self.blocks.len() {
+            x = self.blocks[layer].forward(x);
+        }
+        x.diff("./bins/vis_attn.bin", DIFF_THRESHOLD);
+
+        x = self.ln.forward(x);
+        x
+    }
+}
 
 pub struct SelfAttention {
     qkv: Linear,  // TXT_DIM → (n_heads + 2·n_kv) · head_dim
@@ -213,6 +377,12 @@ impl Mlp {
             fc2: Linear::new_permuted(intermediate, hidden, false, cx),
         }
     }
+    pub fn new_with_bias(hidden: usize, intermediate: usize, cx: &mut Graph) -> Self {
+        Self {
+            fc1: Linear::new_permuted(hidden, intermediate, true, cx),
+            fc2: Linear::new_permuted(intermediate, hidden, true, cx),
+        }
+    }
 }
 
 impl Module<GraphTensor> for Mlp {
@@ -266,12 +436,14 @@ impl Module<(GraphTensor, KVCache)> for TextBlock {
 }
 
 pub struct Moondream {
+    vision_encoder: VisionEncoder,
     embed: Embedding,
     txt_blocks: Vec<TextBlock>,
 }
 impl Moondream {
     pub fn new(cx: &mut Graph) -> Self {
         Self {
+            vision_encoder: VisionEncoder::new(cx),
             embed: Embedding::new(TXT_VOCAB, TXT_DIM, cx),
             txt_blocks: (0..TXT_N_LAYERS).map(|_| TextBlock::new(cx)).collect(),
         }
@@ -286,21 +458,29 @@ impl Module<(GraphTensor, &[KVCache])> for Moondream {
     fn forward(&self, (toks, cache): (GraphTensor, &[KVCache])) -> Self::Output {
         //_generate_text() pseudocode for now
         // toks should be all 1s of shape (1,9)
-        toks.diff("./bins/prompt_tokens.bin", DIFF_THRESHOLD);
 
-        // prefill_prompt
-        let prompt_emb = self.embed.forward(toks);
-        prompt_emb.diff("./bins/prompt_emb.bin", DIFF_THRESHOLD);
-        prompt_emb.diff("./bins/ln_x.bin", DIFF_THRESHOLD);
+        // IMAGE BELOW:
+        toks.diff("./bins/all_crops.bin", DIFF_THRESHOLD);
+        let x = self.vision_encoder.forward(toks);
+        x.diff("./bins/outputs.bin", DIFF_THRESHOLD);
+
+        //TEXT BELOW:
+
+        // toks.diff("./bins/prompt_tokens.bin", DIFF_THRESHOLD);
+
+        // // prefill_prompt
+        // let prompt_emb = self.embed.forward(toks);
+        // prompt_emb.diff("./bins/prompt_emb.bin", DIFF_THRESHOLD);
+        // prompt_emb.diff("./bins/ln_x.bin", DIFF_THRESHOLD);
 
         let new = Vec::with_capacity(TXT_N_LAYERS);
 
-        //text decoder block
-        let mut x = prompt_emb;
-        for layer in 0..self.txt_blocks.len() {
-            let (y, cache) = self.txt_blocks[layer].forward((prompt_emb, cache[0]));
-            x = y
-        }
+        // //text decoder block
+        // let mut x = prompt_emb;
+        // for layer in 0..self.txt_blocks.len() {
+        //     let (y, cache) = self.txt_blocks[layer].forward((prompt_emb, cache[0]));
+        //     x = y
+        // }
 
         (x, new)
     }
@@ -313,7 +493,7 @@ impl Module<(GraphTensor, &[KVCache])> for Moondream {
 impl SerializeModule for Moondream {
     fn serialize(&self, s: &mut Serializer) {
         // Vision branch
-        // s.module("model/vision", &self.vision);
+        s.module("model/vision", &self.vision_encoder);
         // s.module("model/vision/proj_mlp", &self.vis_proj);
         // s.module("model/region", &self.region);
 
@@ -342,9 +522,74 @@ impl SerializeModule for SelfAttention {
     }
 }
 
+impl SerializeModule for VisionAttention {
+    fn serialize(&self, s: &mut Serializer) {
+        s.module("qkv", &self.qkv); // weight key: ".../qkv"
+        s.module("proj", &self.proj); // weight key: ".../proj"
+    }
+}
+
 impl SerializeModule for Mlp {
     fn serialize(&self, s: &mut Serializer) {
         s.module("fc1", &self.fc1);
         s.module("fc2", &self.fc2);
     }
 }
+
+// starting from /vision
+impl SerializeModule for VisionEncoder {
+    fn serialize(&self, s: &mut Serializer) {
+        s.module("patch_emb", &self.linear);
+        s.module("post_ln", &self.ln);
+        s.tensor("pos_emb", self.pos_emb);
+        for (i, blk) in self.blocks.iter().enumerate() {
+            s.module(&format!("blocks/{i}"), blk);
+        }
+    }
+}
+
+//    weight_map = {
+//         "vision_encoder.encoder.model.visual.patch_embed.linear.weight": vision[
+//             "patch_emb"
+//         ].weight,
+//         "vision_encoder.encoder.model.visual.patch_embed.linear.bias": vision[
+//             "patch_emb"
+//         ].bias,
+//         "vision_encoder.encoder.model.visual.pos_embed": vision.pos_emb,
+//         "vision_encoder.encoder.model.visual.norm.weight": vision["post_ln"].weight,
+//         "vision_encoder.encoder.model.visual.norm.bias": vision["post_ln"].bias,
+//         "vision_encoder.projection.mlp.fc1.weight": vision["proj_mlp"]["fc1"].weight,
+//         "vision_encoder.projection.mlp.fc1.bias": vision["proj_mlp"]["fc1"].bias,
+//         "vision_encoder.projection.mlp.fc2.weight": vision["proj_mlp"]["fc2"].weight,
+//         "vision_encoder.projection.mlp.fc2.bias": vision["proj_mlp"]["fc2"].bias,
+//     }
+
+// this will need to be connected, not matching
+impl SerializeModule for VisionBlock {
+    fn serialize(&self, s: &mut Serializer) {
+        s.module("ln1", &self.ln1);
+        s.module("ln2", &self.ln2);
+        s.module("attn", &self.attn);
+        s.module("mlp", &self.mlp);
+    }
+}
+
+// for i in range(len(model.vision["blocks"])):
+//     prefix = f"vision_encoder.encoder.model.visual.blocks.{i}"
+//     blk = model.vision["blocks"][i]
+//     weight_map.update(
+//         {
+//             f"{prefix}.norm1.weight": blk["ln1"].weight,
+//             f"{prefix}.norm1.bias": blk["ln1"].bias,
+//             f"{prefix}.norm2.weight": blk["ln2"].weight,
+//             f"{prefix}.norm2.bias": blk["ln2"].bias,
+//             f"{prefix}.attn.qkv.weight": blk["attn"]["qkv"].weight,
+//             f"{prefix}.attn.qkv.bias": blk["attn"]["qkv"].bias,
+//             f"{prefix}.attn.proj.weight": blk["attn"]["proj"].weight,
+//             f"{prefix}.attn.proj.bias": blk["attn"]["proj"].bias,
+//             f"{prefix}.mlp.fc1.weight": blk["mlp"]["fc1"].weight,
+//             f"{prefix}.mlp.fc1.bias": blk["mlp"]["fc1"].bias,
+//             f"{prefix}.mlp.fc2.weight": blk["mlp"]["fc2"].weight,
+//             f"{prefix}.mlp.fc2.bias": blk["mlp"]["fc2"].bias,
+//         }
+//     )
