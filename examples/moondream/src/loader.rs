@@ -4,7 +4,7 @@ use std::{fs::File, io::Seek};
 
 use luminal::{op::Function, prelude::*};
 use memmap2::{Mmap, MmapOptions};
-use safetensors::{Dtype, SafeTensors};
+use safetensors::{tensor, Dtype, SafeTensors};
 
 pub fn load<M: SerializeModule>(path: &str, model: &M, graph: &mut Graph) {
     for (weight_name, node_index) in param_dict(model) {
