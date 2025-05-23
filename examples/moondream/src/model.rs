@@ -107,12 +107,12 @@ impl Module<GraphTensor> for VisionBlock {
         let l_attn = self.attn.forward(ln_x1);
         x = x + l_attn;
 
-        x.diff("./bins/block_mid.bin", DIFF_THRESHOLD);
+        // x.diff("./bins/block_mid.bin", DIFF_THRESHOLD);
 
         let ln_x2 = self.ln2.forward(x);
         x = x + self.mlp.forward(ln_x2);
 
-        x.diff("./bins/block_end.bin", DIFF_THRESHOLD); // broken
+        // x.diff("./bins/block_end.bin", DIFF_THRESHOLD); // broken
         x
     }
 }
@@ -158,19 +158,19 @@ impl Module<GraphTensor> for VisionEncoder {
     type Output = GraphTensor;
     fn forward(&self, img: GraphTensor) -> Self::Output {
         let mut x = create_patches(img);
-        x.diff("./bins/create_patches.bin", DIFF_THRESHOLD);
+        // x.diff("./bins/create_patches.bin", DIFF_THRESHOLD);
         x = self.linear.forward(x);
-        x.diff("./bins/linear.bin", DIFF_THRESHOLD);
-        self.pos_emb.diff("./bins/wpos_emb.bin", DIFF_THRESHOLD);
+        // x.diff("./bins/linear.bin", DIFF_THRESHOLD);
+        // self.pos_emb.diff("./bins/wpos_emb.bin", DIFF_THRESHOLD);
         println!("{:?} + {:?}", self.pos_emb.dims(), x.dims());
         x = x + self.pos_emb; // source of NaN
         println!("= {:?}", x.dims());
-        x.diff("./bins/pos_emb.bin", DIFF_THRESHOLD);
+        // x.diff("./bins/pos_emb.bin", DIFF_THRESHOLD);
 
         for layer in 0..self.blocks.len() {
             x = self.blocks[layer].forward(x);
         }
-        x.diff("./bins/vis_attn.bin", DIFF_THRESHOLD);
+        // x.diff("./bins/vis_attn.bin", DIFF_THRESHOLD);
 
         x = self.ln.forward(x);
         x
@@ -280,15 +280,15 @@ impl Module<(GraphTensor, KVCache)> for SelfAttention {
 
         let position_ids: Vec<usize> = vec![730, 731, 732, 733, 734, 735, 736, 737, 738]; // will be derived from p
 
-        x.diff("./bins/attn_x.bin", DIFF_THRESHOLD);
+        // x.diff("./bins/attn_x.bin", DIFF_THRESHOLD);
 
-        self.qkv
-            .weight
-            .diff("./bins/qvk_weight.bin", DIFF_THRESHOLD);
-        self.qkv
-            .bias
-            .unwrap()
-            .diff("./bins/qvk_bias.bin", DIFF_THRESHOLD);
+        // self.qkv
+        //     .weight
+        //     .diff("./bins/qvk_weight.bin", DIFF_THRESHOLD);
+        // self.qkv
+        //     .bias
+        //     .unwrap()
+        //     .diff("./bins/qvk_bias.bin", DIFF_THRESHOLD);
 
         // fused projection
         let qkv = self.qkv.forward(x);
@@ -298,7 +298,7 @@ impl Module<(GraphTensor, KVCache)> for SelfAttention {
             qkv.shape, TXT_N_HEADS, TXT_HEAD_DIM, b, s
         );
 
-        qkv.diff("./bins/qkv_out.bin", DIFF_THRESHOLD);
+        // qkv.diff("./bins/qkv_out.bin", DIFF_THRESHOLD);
         let q_dim = TXT_N_HEADS * TXT_HEAD_DIM;
         let kv_dim = TXT_N_KV * TXT_HEAD_DIM;
 
@@ -325,16 +325,16 @@ impl Module<(GraphTensor, KVCache)> for SelfAttention {
             .permute((0, 2, 1, 3));
 
         //confirming our pull is correct
-        q.diff("./bins/q_b.bin", DIFF_THRESHOLD);
-        k.diff("./bins/k_b.bin", DIFF_THRESHOLD);
-        v.diff("./bins/v_b.bin", DIFF_THRESHOLD);
+        // q.diff("./bins/q_b.bin", DIFF_THRESHOLD);
+        // k.diff("./bins/k_b.bin", DIFF_THRESHOLD);
+        // v.diff("./bins/v_b.bin", DIFF_THRESHOLD);
 
         // rotary & cache
         let q = apply_rotary_embeddings(q, position_ids[0], position_ids[position_ids.len() - 1]);
         let k = apply_rotary_embeddings(k, position_ids[0], position_ids[position_ids.len() - 1]);
 
-        q.diff("./bins/q_rot.bin", DIFF_THRESHOLD);
-        k.diff("./bins/k_rot.bin", DIFF_THRESHOLD);
+        // q.diff("./bins/q_rot.bin", DIFF_THRESHOLD);
+        // k.diff("./bins/k_rot.bin", DIFF_THRESHOLD);
 
         println!("{:?} x {:?} = attn", q.dims(), k.dims());
 
@@ -357,7 +357,7 @@ impl Module<(GraphTensor, KVCache)> for SelfAttention {
         println!("A: {:?}\nV: {:?}", att.dims(), v.dims());
 
         let out = att.matmul(v).permute((0, 2, 1, 3)).reshape((b, s, TXT_DIM));
-        out.diff("./bins/attn_out.bin", DIFF_THRESHOLD);
+        // out.diff("./bins/attn_out.bin", DIFF_THRESHOLD);
 
         // delcaring victory here, it won't match perfectly until the image stuff is done
 
@@ -413,19 +413,19 @@ impl Module<(GraphTensor, KVCache)> for TextBlock {
     fn forward(&self, (x, cache): (GraphTensor, KVCache)) -> Self::Output {
         //layer norm
         let l_ln = self.ln.forward(x);
-        self.ln
-            .weight
-            .unwrap()
-            .diff("./bins/ln_weight.bin", DIFF_THRESHOLD);
-        self.ln
-            .bias
-            .unwrap()
-            .diff("./bins/ln_bias.bin", DIFF_THRESHOLD);
-        l_ln.diff("./bins/ln.bin", DIFF_THRESHOLD);
+        // self.ln
+        //     .weight
+        //     .unwrap()
+        //     .diff("./bins/ln_weight.bin", DIFF_THRESHOLD);
+        // self.ln
+        //     .bias
+        //     .unwrap()
+        //     .diff("./bins/ln_bias.bin", DIFF_THRESHOLD);
+        // l_ln.diff("./bins/ln.bin", DIFF_THRESHOLD);
 
         //attention
         let (l_attn, cache) = self.attn.forward((l_ln, cache));
-        l_attn.diff("./bins/l_attn.bin", DIFF_THRESHOLD);
+        // l_attn.diff("./bins/l_attn.bin", DIFF_THRESHOLD);
 
         //MLP
         let l_mlp = self.mlp.forward(l_ln);
@@ -452,16 +452,17 @@ impl Moondream {
 
 pub type KVCache = (GraphTensor, GraphTensor);
 
-impl Module<(GraphTensor, &[KVCache])> for Moondream {
+impl Module<(GraphTensor, GraphTensor, &[KVCache])> for Moondream {
     // Args: (image_tensor, token_ids, kv_cache[])
     type Output = (GraphTensor, Vec<KVCache>);
-    fn forward(&self, (toks, cache): (GraphTensor, &[KVCache])) -> Self::Output {
+    fn forward(&self, (img, toks, cache): (GraphTensor, GraphTensor, &[KVCache])) -> Self::Output {
         //_generate_text() pseudocode for now
         // toks should be all 1s of shape (1,9)
 
         // IMAGE BELOW:
-        toks.diff("./bins/all_crops.bin", DIFF_THRESHOLD);
+        img.diff("./bins/all_crops.bin", DIFF_THRESHOLD);
         let x = self.vision_encoder.forward(toks);
+        //load into kv cache
         x.diff("./bins/outputs.bin", DIFF_THRESHOLD);
 
         //TEXT BELOW:

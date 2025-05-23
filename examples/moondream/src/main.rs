@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::{self, Read, Write},
+    path::Path,
     time::Instant,
 };
 
@@ -11,6 +12,7 @@ use luminal_nn::Embedding;
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 
+mod image_process;
 mod loader;
 mod model;
 
@@ -51,8 +53,10 @@ fn main() {
     let model = model::Moondream::new(&mut cx);
     loader::load("setup/moondream2.safetensors", &model, &mut cx);
 
-    println!("ME");
-    let (mut out, _) = model.forward((toks, &cache));
+    let (img, (height, width)) =
+        image_process::prepare_crops(Path::new("./prompts/hi.txt"), &mut cx);
+
+    let (mut out, _) = model.forward((img, toks, &cache));
 
     cx.compile(
         (
