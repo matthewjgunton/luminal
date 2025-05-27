@@ -6,6 +6,42 @@ use luminal::{op::Function, prelude::*};
 use memmap2::{Mmap, MmapOptions};
 use safetensors::{tensor, Dtype, SafeTensors};
 
+pub fn load_image_binary_with_path(img: &GraphTensor, graph: &mut Graph, file_path: &str) {
+    let path = file_path.to_string();
+
+    if let Some(loading_node) = graph
+        .graph
+        .node_weight_mut(img.id)
+        .and_then(|op| op.as_any_mut().downcast_mut::<Function>())
+    {
+        loading_node.1 = Box::new(move |_| {
+            let mut file =
+                File::open(&path).unwrap_or_else(|_| panic!("Failed to open file: {}", path));
+
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)
+                .unwrap_or_else(|_| panic!("Failed to read file: {}", path));
+
+            let expected_size = 10 * 3 * 378 * 378 * 4;
+
+            if buffer.len() != expected_size {
+                panic!(
+                    "File size mismatch. Expected {} bytes, got {} bytes",
+                    expected_size,
+                    buffer.len()
+                );
+            }
+
+            let data: Vec<f32> = buffer
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+
+            vec![Tensor::new(data)]
+        });
+    }
+}
+
 pub fn load<M: SerializeModule>(path: &str, model: &M, graph: &mut Graph) {
     for (weight_name, node_index) in param_dict(model) {
         if let Some(loading_node) = graph

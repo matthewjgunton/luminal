@@ -12,3 +12,5 @@ mod transformer;
 pub use transformer::*;
 mod pooling;
 pub use pooling::*;
+mod mlp;
+pub use mlp::*;
