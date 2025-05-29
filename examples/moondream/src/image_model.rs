@@ -16,6 +16,43 @@ pub const VIS_HEAD_DIM: usize = VIS_DIM / VIS_ENC_N_HEADS;
 pub const ATOL: f32 = 1e-4;
 pub const RTOL: f32 = 5e-3;
 
+pub struct VisionModel {
+    vision_projector: VisionProjector,
+    vision_encoder: VisionEncoder,
+}
+impl VisionModel {
+    pub fn new(cx: &mut Graph) -> Self {
+        Self {
+            vision_projector: VisionProjector::new(cx),
+            vision_encoder: VisionEncoder::new(cx),
+        }
+    }
+}
+
+impl Module<GraphTensor> for VisionModel {
+    type Output = GraphTensor;
+    fn forward(&self, img: GraphTensor) -> Self::Output {
+        let x = self.vision_encoder.forward(img);
+
+        let (a, _, _) = x.dims3();
+
+        let global_features = x
+            .slice((..Expression::from(0), .., ..))
+            .reshape((VIS_NUM_PATCHES, VIS_DIM)) // unsqueeze effectively
+            .contiguous();
+        let local_features = x
+            .slice((Expression::from(1).., .., ..))
+            .reshape((a - 1, VIS_N_LAYERS, VIS_N_LAYERS, VIS_DIM)) // unsqueeze effectively
+            .contiguous();
+        let reconstructed = self::reconstruct_from_crops(local_features);
+
+        let img_emb = self
+            .vision_projector
+            .forward((global_features, reconstructed)); // (expecting (729, 2048)
+        img_emb
+    }
+}
+
 pub struct VisionAttention {
     qkv: Linear,
     proj: Linear,
@@ -158,63 +195,60 @@ impl Module<GraphTensor> for VisionEncoder {
 pub fn reconstruct_from_crops(crops: GraphTensor) -> GraphTensor {
     let tiling_h = 378;
     let tiling_w = 378;
-    let (_, crop_height, crop_width, channels) = crops.dims4();
+    let (num_crops, crop_height, crop_width, channels) = crops.dims4();
 
     let channels_usize = channels.to_usize().unwrap();
     let crop_height_usize = crop_height.to_usize().unwrap();
     let crop_width_usize = crop_width.to_usize().unwrap();
     let margin_pixels = 4 * 1;
 
-    let tile_height = crop_height_usize - 2 * margin_pixels;
-    let tile_width = crop_width_usize - 2 * margin_pixels;
-    let output_h = tile_height * tiling_h + 2 * margin_pixels;
-    let output_w = tile_width * tiling_w + 2 * margin_pixels;
+    let output_h = (crop_height * margin_pixels) * tiling_h + 2 * margin_pixels;
+    let output_w = (crop_width * margin_pixels) * tiling_w + 2 * margin_pixels;
 
-    let mut result_pieces = Vec::new();
+    // this seems to be where the huge number of graph operations are coming from (1 slice)
+    // need to find a better way to do this...
+    // match the enumeration 1:1
+    let mut reconstructed = None;
+    for crop in 0..num_crops.to_usize().unwrap() {
+        let tile_y = crop / tiling_w; // floor division for usizes
+        let tile_x = crop % tiling_w;
 
-    for tile_y in 0..tiling_h {
-        let mut row_pieces = Vec::new();
+        let mut x_start = margin_pixels;
+        let mut x_end = crop_width_usize - margin_pixels;
+        let mut y_start = margin_pixels;
+        let mut y_end = crop_height_usize - margin_pixels;
 
-        for tile_x in 0..tiling_w {
-            let i = tile_y * tiling_w + tile_x;
-
-            let current_crop = crops.slice((i..i + 1, .., .., ..)).reshape((
-                crop_height_usize,
-                crop_width_usize,
-                channels_usize,
-            ));
-
-            let x_start = if tile_x == 0 { 0 } else { margin_pixels };
-            let x_end = if tile_x == tiling_w - 1 {
-                crop_width_usize
-            } else {
-                crop_width_usize - margin_pixels
-            };
-
-            let y_start = if tile_y == 0 { 0 } else { margin_pixels };
-            let y_end = if tile_y == tiling_h - 1 {
-                crop_height_usize
-            } else {
-                crop_height_usize - margin_pixels
-            };
-
-            let piece = current_crop.slice((y_start..y_end, x_start..x_end, ..));
-            row_pieces.push(piece);
+        if tile_x == 0 {
+            x_start = 0;
+        }
+        if tile_x == tiling_w - 1 {
+            x_end = crop_width_usize;
+        }
+        if tile_y == 0 {
+            y_start = 0;
+        }
+        if tile_y == tiling_h - 1 {
+            y_end = crop_height_usize;
         }
 
-        let mut row_tensor = row_pieces[0];
-        for piece in row_pieces.into_iter().skip(1) {
-            row_tensor = row_tensor.concat_along(piece, 1);
+        let cropped_val = crops
+            .slice((crop..crop + 1, y_start..y_end, x_start..x_end, ..))
+            .contiguous();
+        println!("CROP: {:?}", cropped_val.dims());
+        if crop == 0 {
+            reconstructed = Some(cropped_val);
+        } else {
+            if let Some(ref mut recon) = reconstructed {
+                *recon = recon.concat_along(cropped_val, 0);
+            }
         }
-        result_pieces.push(row_tensor);
     }
-
-    let mut final_result = result_pieces[0];
-    for row_tensor in result_pieces.into_iter().skip(1) {
-        final_result = final_result.concat_along(row_tensor, 0);
-    }
-
-    final_result
+    let output = reconstructed
+        .unwrap()
+        .reshape((output_h, output_w, channels_usize))
+        .contiguous();
+    println!("FINAL: {:?}", output.dims());
+    output
 }
 
 pub struct VisionProjector {
@@ -256,6 +290,13 @@ impl Module<(GraphTensor, GraphTensor)> for VisionProjector {
     }
 }
 
+impl SerializeModule for VisionModel {
+    fn serialize(&self, s: &mut Serializer) {
+        s.module("model/vision", &self.vision_projector);
+        s.module("model/vision", &self.vision_encoder);
+    }
+}
+
 impl SerializeModule for VisionEncoder {
     fn serialize(&self, s: &mut Serializer) {
         s.module("patch_emb", &self.linear);
@@ -273,6 +314,13 @@ impl SerializeModule for VisionBlock {
         s.module("ln2", &self.ln2);
         s.module("attn", &self.attn);
         s.module("mlp", &self.mlp);
+    }
+}
+
+impl SerializeModule for VisionProjector {
+    fn serialize(&self, s: &mut Serializer) {
+        s.module("proj_mlp", &self.mlp);
+        // no learned weights for avg pool
     }
 }
 
