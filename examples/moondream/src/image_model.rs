@@ -9,13 +9,10 @@ pub const VIS_PATCH_SIZE: usize = 14;
 pub const VIS_PATCH_DIM: usize = VIS_PATCH_SIZE * VIS_PATCH_SIZE * 3; // 588
 pub const VIS_NUM_PATCHES: usize = 729;
 pub const VIS_FF_DIM: usize = 4304;
-pub const VIS_N_LAYERS: usize = 27; //27; keeping it truly simple for now
+pub const VIS_N_LAYERS: usize = 27;
 pub const VIS_ENC_N_HEADS: usize = 16;
 pub const VIS_HEAD_DIM: usize = VIS_DIM / VIS_ENC_N_HEADS;
 
-// guessing: (1) redo attention for encoding head as parameter
-
-// ATOL + RTOL * b.abs() allows for a
 pub const ATOL: f32 = 1e-4;
 pub const RTOL: f32 = 5e-3;
 
@@ -26,14 +23,14 @@ pub struct VisionAttention {
 impl VisionAttention {
     pub fn new(cx: &mut Graph) -> Self {
         Self {
-            qkv: Linear::new_permuted(VIS_DIM, VIS_DIM * 3, true, cx), // shape here is up for debate
-            proj: Linear::new_permuted(VIS_DIM, VIS_DIM, true, cx), // shape here is up for debate
+            qkv: Linear::new_permuted(VIS_DIM, VIS_DIM * 3, true, cx),
+            proj: Linear::new_permuted(VIS_DIM, VIS_DIM, true, cx),
         }
     }
 }
-// like text but no mask & no rotary pos
+
 impl Module<GraphTensor> for VisionAttention {
-    type Output = GraphTensor; // (b, n_tokens, VIS_DIM)
+    type Output = GraphTensor;
     fn forward(&self, x: GraphTensor) -> Self::Output {
         let (bsz, q_len, d_model) = x.dims3();
         let head_dim = d_model / VIS_ENC_N_HEADS;
@@ -63,7 +60,7 @@ impl Module<GraphTensor> for VisionAttention {
             .permute((0, 2, 1, 3))
             .contiguous();
 
-        let mut att = q.matmul(k.permute((0, 1, 3, 2))); // dims are right, this is likely correct
+        let mut att = q.matmul(k.permute((0, 1, 3, 2)));
 
         let sqrt_dk = (VIS_HEAD_DIM as f32).sqrt();
         att = att * (1.0 / sqrt_dk);
@@ -96,19 +93,16 @@ impl VisionBlock {
 }
 
 impl Module<GraphTensor> for VisionBlock {
-    type Output = GraphTensor; // (b, n_tokens, VIS_DIM)
+    type Output = GraphTensor;
     fn forward(&self, mut x: GraphTensor) -> Self::Output {
         let ln_x1 = self.ln1.forward(x);
-        // make a key value cache maybe?
+
         let l_attn = self.attn.forward(ln_x1);
         x = x + l_attn;
-
-        // x.diff("./bins/block_mid.bin", DIFF_THRESHOLD);
 
         let ln_x2 = self.ln2.forward(x);
         x = x + self.mlp.forward(ln_x2);
 
-        // x.diff("./bins/block_end.bin", DIFF_THRESHOLD); // broken
         x
     }
 }
@@ -117,17 +111,10 @@ fn create_patches(mut x: GraphTensor) -> GraphTensor {
     let (b, c, h, w) = x.dims4();
     let p1 = VIS_PATCH_SIZE;
 
-    // Step 1: Split H and W dimensions into patches
-    //[B, C, H/P1, P1, W/P2, P2]
     x = x.reshape((b, c, h / p1, p1, w / p1, p1));
-    // x = x.reshape(B, C, H // P1, P1, W // P2, P2)
 
-    // # Step 2: Rearrange dimensions to match target shape
-    // # [B, H/P1, W/P2, C, P1, P2]
     x = x.permute((0, 2, 4, 1, 3, 5));
 
-    // # Step 3: Combine dimensions to get final shape
-    // # [B, (H/P1)*(W/P2), C*P1*P2]
     x = x.reshape((b, (h / p1) * (w / p1), c * p1 * p1));
 
     x
@@ -157,7 +144,6 @@ impl Module<GraphTensor> for VisionEncoder {
 
         x = self.linear.forward(x);
 
-        // self.pos_emb.diff("./bins/wpos_emb.bin", DIFF_THRESHOLD);
         x = x + self.pos_emb;
 
         for layer in 0..self.blocks.len() {
@@ -184,24 +170,20 @@ pub fn reconstruct_from_crops(crops: GraphTensor) -> GraphTensor {
     let output_h = tile_height * tiling_h + 2 * margin_pixels;
     let output_w = tile_width * tiling_w + 2 * margin_pixels;
 
-    // Process crops in batches by position type (corner, edge, center)
     let mut result_pieces = Vec::new();
 
-    // Process each tile position
     for tile_y in 0..tiling_h {
         let mut row_pieces = Vec::new();
 
         for tile_x in 0..tiling_w {
             let i = tile_y * tiling_w + tile_x;
 
-            // Get the current crop
             let current_crop = crops.slice((i..i + 1, .., .., ..)).reshape((
                 crop_height_usize,
                 crop_width_usize,
                 channels_usize,
             ));
 
-            // Determine crop boundaries
             let x_start = if tile_x == 0 { 0 } else { margin_pixels };
             let x_end = if tile_x == tiling_w - 1 {
                 crop_width_usize
@@ -216,23 +198,20 @@ pub fn reconstruct_from_crops(crops: GraphTensor) -> GraphTensor {
                 crop_height_usize - margin_pixels
             };
 
-            // Extract the piece
             let piece = current_crop.slice((y_start..y_end, x_start..x_end, ..));
             row_pieces.push(piece);
         }
 
-        // Concatenate all pieces in this row horizontally
         let mut row_tensor = row_pieces[0];
         for piece in row_pieces.into_iter().skip(1) {
-            row_tensor = row_tensor.concat_along(piece, 1); // Concat along width
+            row_tensor = row_tensor.concat_along(piece, 1);
         }
         result_pieces.push(row_tensor);
     }
 
-    // Concatenate all rows vertically
     let mut final_result = result_pieces[0];
     for row_tensor in result_pieces.into_iter().skip(1) {
-        final_result = final_result.concat_along(row_tensor, 0); // Concat along height
+        final_result = final_result.concat_along(row_tensor, 0);
     }
 
     final_result
@@ -277,7 +256,6 @@ impl Module<(GraphTensor, GraphTensor)> for VisionProjector {
     }
 }
 
-// starting from /vision
 impl SerializeModule for VisionEncoder {
     fn serialize(&self, s: &mut Serializer) {
         s.module("patch_emb", &self.linear);
@@ -300,7 +278,7 @@ impl SerializeModule for VisionBlock {
 
 impl SerializeModule for VisionAttention {
     fn serialize(&self, s: &mut Serializer) {
-        s.module("qkv", &self.qkv); // weight key: ".../qkv"
-        s.module("proj", &self.proj); // weight key: ".../proj"
+        s.module("qkv", &self.qkv);
+        s.module("proj", &self.proj);
     }
 }

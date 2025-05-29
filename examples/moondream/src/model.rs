@@ -26,7 +26,6 @@ impl Moondream {
 
 pub type KVCache = (GraphTensor, GraphTensor);
 
-// this is now akin to the _generator
 impl Module<(GraphTensor, &[KVCache], usize, usize)> for Moondream {
     type Output = (GraphTensor, Vec<KVCache>);
     fn forward(
@@ -35,7 +34,6 @@ impl Module<(GraphTensor, &[KVCache], usize, usize)> for Moondream {
     ) -> Self::Output {
         let mut prompt = self.text_encoder.forward(toks);
 
-        //text decoder
         let mut new_caches = vec![];
         let mut new_cache: KVCache;
         for layer in 0..self.text_decoder.len() {
@@ -45,7 +43,6 @@ impl Module<(GraphTensor, &[KVCache], usize, usize)> for Moondream {
             prompt = y;
         }
 
-        // lm_head:
         let logits = self.lm_head.forward(prompt);
 
         (logits, new_caches)
@@ -62,7 +59,6 @@ pub fn _run_vision_encoder(
 
     let (a, _, _) = x.dims3();
 
-    //(3) reconstruct
     let global_features = x
         .slice((..Expression::from(0), .., ..))
         .reshape((VIS_NUM_PATCHES, VIS_DIM)) // unsqueeze effectively
@@ -73,12 +69,10 @@ pub fn _run_vision_encoder(
         .contiguous();
     let reconstructed = image_model::reconstruct_from_crops(local_features);
 
-    //(4)_vis_proj [pending]
     let img_emb = moondream
         .vision_projector
         .forward((global_features, reconstructed)); // (expecting (729, 2048)
 
-    //(5) text encoding embeddings
     let bos_tensor = cx.tensor((1, 1)).set(vec![BOS_ID]); // (expecting 1,1,2048)
     moondream.text_encoder.forward(bos_tensor);
     let mut prompt = img_emb
@@ -95,6 +89,10 @@ pub fn _run_vision_encoder(
         new_caches.push(new_cache);
         prompt = y;
     }
+    let (lastk, lastv) = new_caches.get(new_caches.len() - 1).unwrap();
+    println!("HITHITHIT");
+    lastk.diff("./bins/lastk.bin", ATOL, RTOL);
+    lastv.diff("./bins/lastv.bin", ATOL, RTOL);
     (new_caches)
 }
 
@@ -108,8 +106,6 @@ impl SerializeModule for Moondream {
     fn serialize(&self, s: &mut Serializer) {
         // Vision branch
         s.module("model/vision", &self.vision_encoder);
-        // s.module("model/vision/proj_mlp", &self.vis_proj);
-        // s.module("model/region", &self.region);
 
         // Text branch
         s.tensor("model/text/wte", self.text_encoder.weight);
@@ -117,45 +113,5 @@ impl SerializeModule for Moondream {
             s.module(&format!("model/text/blocks/{i}"), blk);
         }
         s.module("model/text", &self.lm_head);
-        // s.module("model/text/post_ln", &self.txt_norm);
-        // s.module("model/text/lm_head", &self.lm_head);
     }
 }
-
-//    weight_map = {
-//         "vision_encoder.encoder.model.visual.patch_embed.linear.weight": vision[
-//             "patch_emb"
-//         ].weight,
-//         "vision_encoder.encoder.model.visual.patch_embed.linear.bias": vision[
-//             "patch_emb"
-//         ].bias,
-//         "vision_encoder.encoder.model.visual.pos_embed": vision.pos_emb,
-//         "vision_encoder.encoder.model.visual.norm.weight": vision["post_ln"].weight,
-//         "vision_encoder.encoder.model.visual.norm.bias": vision["post_ln"].bias,
-//         "vision_encoder.projection.mlp.fc1.weight": vision["proj_mlp"]["fc1"].weight,
-//         "vision_encoder.projection.mlp.fc1.bias": vision["proj_mlp"]["fc1"].bias,
-//         "vision_encoder.projection.mlp.fc2.weight": vision["proj_mlp"]["fc2"].weight,
-//         "vision_encoder.projection.mlp.fc2.bias": vision["proj_mlp"]["fc2"].bias,
-//     }
-
-// this will need to be connected, not matching
-
-// for i in range(len(model.vision["blocks"])):
-//     prefix = f"vision_encoder.encoder.model.visual.blocks.{i}"
-//     blk = model.vision["blocks"][i]
-//     weight_map.update(
-//         {
-//             f"{prefix}.norm1.weight": blk["ln1"].weight,
-//             f"{prefix}.norm1.bias": blk["ln1"].bias,
-//             f"{prefix}.norm2.weight": blk["ln2"].weight,
-//             f"{prefix}.norm2.bias": blk["ln2"].bias,
-//             f"{prefix}.attn.qkv.weight": blk["attn"]["qkv"].weight,
-//             f"{prefix}.attn.qkv.bias": blk["attn"]["qkv"].bias,
-//             f"{prefix}.attn.proj.weight": blk["attn"]["proj"].weight,
-//             f"{prefix}.attn.proj.bias": blk["attn"]["proj"].bias,
-//             f"{prefix}.mlp.fc1.weight": blk["mlp"]["fc1"].weight,
-//             f"{prefix}.mlp.fc1.bias": blk["mlp"]["fc1"].bias,
-//             f"{prefix}.mlp.fc2.weight": blk["mlp"]["fc2"].weight,
-//             f"{prefix}.mlp.fc2.bias": blk["mlp"]["fc2"].bias,
-//         }
-//     )
