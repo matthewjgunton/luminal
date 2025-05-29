@@ -70,7 +70,6 @@ fn apply_rotary_embeddings(x: GraphTensor, start: usize, end: usize) -> GraphTen
     // Get tensor dimensions
     let (b, h, s, d) = x_rot.dims4();
     let d_q = d / 2;
-    println!("___ {:?} | {d_q}", x_rot.dims());
 
     // Split into real/imaginary components
     let xq_r = x_rot.slice((.., .., .., ..d_q)).contiguous();
@@ -103,14 +102,6 @@ fn apply_rotary_embeddings(x: GraphTensor, start: usize, end: usize) -> GraphTen
         .expand(1, 32)
         .contiguous();
 
-    println!(
-        "{:?} * {:?} - {:?} * {:?}",
-        xq_r.dims(),
-        cos.dims(),
-        xq_i.dims(),
-        sin.dims()
-    );
-
     // cos.diff("./bins/freqs_cos.bin", DIFF_THRESHOLD);
     // sin.diff("./bins/freqs_sin.bin", DIFF_THRESHOLD);
 
@@ -118,8 +109,6 @@ fn apply_rotary_embeddings(x: GraphTensor, start: usize, end: usize) -> GraphTen
     // xr.diff("./bins/xq_out_r.bin", DIFF_THRESHOLD);
     let xi: GraphTensor = xq_r * sin + xq_i * cos;
     // xi.diff("./bins/xq_out_i.bin", DIFF_THRESHOLD);
-
-    println!("{:?} - {:?} ", xr.dims(), xi.dims());
 
     let (a, b, c, d) = xr.dims4();
     let x_rotated = xr
@@ -135,12 +124,12 @@ fn apply_rotary_embeddings(x: GraphTensor, start: usize, end: usize) -> GraphTen
     output
 }
 
-impl Module<(GraphTensor, KVCache, &[usize])> for SelfAttention {
+impl Module<(GraphTensor, KVCache, usize, usize)> for SelfAttention {
     type Output = (GraphTensor, KVCache);
 
     fn forward(
         &self,
-        (x, (k_cache, v_cache), position_ids): (GraphTensor, KVCache, &[usize]),
+        (x, (k_cache, v_cache), pos_start, pos_end): (GraphTensor, KVCache, usize, usize),
     ) -> Self::Output {
         let (b, s, _) = x.dims3();
         let (_, _, p, _) = k_cache.dims4();
@@ -158,11 +147,6 @@ impl Module<(GraphTensor, KVCache, &[usize])> for SelfAttention {
 
         // fused projection
         let qkv = self.qkv.forward(x);
-
-        println!(
-            "{:?} = {} {} {} {}",
-            qkv.shape, TXT_N_HEADS, TXT_HEAD_DIM, b, s
-        );
 
         // qkv.diff("./bins/qkv_out.bin", DIFF_THRESHOLD);
         let q_dim = TXT_N_HEADS * TXT_HEAD_DIM;
@@ -196,8 +180,8 @@ impl Module<(GraphTensor, KVCache, &[usize])> for SelfAttention {
         // v.diff("./bins/v_b.bin", DIFF_THRESHOLD);
 
         // rotary & cache
-        let q = apply_rotary_embeddings(q, position_ids[0], position_ids[position_ids.len() - 1]);
-        let k = apply_rotary_embeddings(k, position_ids[0], position_ids[position_ids.len() - 1]);
+        let q = apply_rotary_embeddings(q, pos_start, pos_end);
+        let k = apply_rotary_embeddings(k, pos_start, pos_end);
         let k = k_cache.concat_along(k, 2);
         let v = v_cache.concat_along(v, 2);
 
@@ -215,12 +199,10 @@ impl Module<(GraphTensor, KVCache, &[usize])> for SelfAttention {
             .expand(0, 1)
             .expand(1, 32)
             .contiguous();
-        println!("{:?}", mask.dims());
         let sqrt_dk = (head_dim as f32).sqrt();
         att = att * (1.0 / sqrt_dk);
         att = att + (mask * f32::NEG_INFINITY);
         att = att.softmax(3);
-        println!("A: {:?}\nV: {:?}", att.dims(), v.dims());
 
         let out = att.matmul(v).permute((0, 2, 1, 3)).reshape((b, s, TXT_DIM));
         // out.diff("./bins/attn_out.bin", DIFF_THRESHOLD);
@@ -228,44 +210,6 @@ impl Module<(GraphTensor, KVCache, &[usize])> for SelfAttention {
         // delcaring victory here, it won't match perfectly until the image stuff is done
 
         (self.proj.forward(out), (k.contiguous(), v.contiguous()))
-    }
-}
-
-pub struct Mlp {
-    pub fc1: Linear, // hidden -> intermediate
-    pub fc2: Linear, // intermediate -> hidden
-}
-
-impl Mlp {
-    pub fn new(hidden: usize, intermediate: usize, cx: &mut Graph) -> Self {
-        Self {
-            fc1: Linear::new_permuted(hidden, intermediate, false, cx),
-            fc2: Linear::new_permuted(intermediate, hidden, false, cx),
-        }
-    }
-    pub fn new_with_bias(hidden: usize, intermediate: usize, cx: &mut Graph) -> Self {
-        Self {
-            fc1: Linear::new_permuted(hidden, intermediate, true, cx),
-            fc2: Linear::new_permuted(intermediate, hidden, true, cx),
-        }
-    }
-    pub fn new_different_intermediary(
-        input: usize,
-        intermediate: usize,
-        output: usize,
-        cx: &mut Graph,
-    ) -> Self {
-        Self {
-            fc1: Linear::new_permuted(input, intermediate, true, cx),
-            fc2: Linear::new_permuted(intermediate, output, true, cx),
-        }
-    }
-}
-
-impl Module<GraphTensor> for Mlp {
-    type Output = GraphTensor;
-    fn forward(&self, x: GraphTensor) -> Self::Output {
-        self.fc2.forward(self.fc1.forward(x).gelu())
     }
 }
 
@@ -285,9 +229,12 @@ impl TextBlock {
     }
 }
 
-impl Module<(GraphTensor, KVCache, &[usize])> for TextBlock {
+impl Module<(GraphTensor, KVCache, usize, usize)> for TextBlock {
     type Output = (GraphTensor, KVCache);
-    fn forward(&self, (x, cache, pos_ids): (GraphTensor, KVCache, &[usize])) -> Self::Output {
+    fn forward(
+        &self,
+        (x, cache, pos_start, pos_end): (GraphTensor, KVCache, usize, usize),
+    ) -> Self::Output {
         //layer norm
         let l_ln = self.ln.forward(x);
         // self.ln
@@ -301,7 +248,7 @@ impl Module<(GraphTensor, KVCache, &[usize])> for TextBlock {
         // l_ln.diff("./bins/ln.bin", DIFF_THRESHOLD);
 
         //attention
-        let (l_attn, cache) = self.attn.forward((l_ln, cache, pos_ids));
+        let (l_attn, cache) = self.attn.forward((l_ln, cache, pos_start, pos_end));
         // l_attn.diff("./bins/l_attn.bin", DIFF_THRESHOLD);
 
         //MLP
@@ -324,13 +271,6 @@ impl SerializeModule for SelfAttention {
     fn serialize(&self, s: &mut Serializer) {
         s.module("qkv", &self.qkv); // weight key: ".../qkv"
         s.module("proj", &self.proj); // weight key: ".../proj"
-    }
-}
-
-impl SerializeModule for Mlp {
-    fn serialize(&self, s: &mut Serializer) {
-        s.module("fc1", &self.fc1);
-        s.module("fc2", &self.fc2);
     }
 }
 

@@ -153,96 +153,89 @@ impl VisionEncoder {
 impl Module<GraphTensor> for VisionEncoder {
     type Output = GraphTensor;
     fn forward(&self, img: GraphTensor) -> Self::Output {
-        img.diff("./prompts/image.bin", ATOL, RTOL);
         let mut x = create_patches(img);
-        x.diff("./bins/create_patches.bin", ATOL, RTOL);
-
-        self.linear
-            .weight
-            .diff("./bins/linear_weights.bin", ATOL, RTOL);
-
-        self.linear
-            .bias
-            .unwrap()
-            .diff("./bins/linear_bias.bin", ATOL, RTOL);
 
         x = self.linear.forward(x);
-        x.diff("./bins/linear.bin", ATOL, RTOL);
 
         // self.pos_emb.diff("./bins/wpos_emb.bin", DIFF_THRESHOLD);
-        println!("{:?} + {:?}", self.pos_emb.dims(), x.dims());
         x = x + self.pos_emb;
-
-        println!("= {:?}", x.dims());
-        // x.diff("./bins/pos_emb.bin", DIFF_THRESHOLD);
-        x.diff("./bins/vis_enc_linpos.bin", ATOL, RTOL);
 
         for layer in 0..self.blocks.len() {
             x = self.blocks[layer].forward(x);
         }
-        x.diff("./bins/vis_attn.bin", ATOL, RTOL);
 
         x = self.ln.forward(x);
         x
     }
 }
 
-pub fn reconstruct_from_crops(crops: GraphTensor) -> (Vec<f32>, (usize, usize, usize)) {
+pub fn reconstruct_from_crops(crops: GraphTensor) -> GraphTensor {
     let tiling_h = 378;
     let tiling_w = 378;
-    let (range, crop_height, crop_width, channels) = crops.dims4();
-    let crops_data = crops.data();
+    let (_, crop_height, crop_width, channels) = crops.dims4();
 
     let channels_usize = channels.to_usize().unwrap();
-    let range_usize = range.to_usize().unwrap();
     let crop_height_usize = crop_height.to_usize().unwrap();
     let crop_width_usize = crop_width.to_usize().unwrap();
+    let margin_pixels = 4 * 1;
 
-    let margin_pixels = 4 * VIS_PATCH_SIZE; // 4 = overlap margin
+    let tile_height = crop_height_usize - 2 * margin_pixels;
+    let tile_width = crop_width_usize - 2 * margin_pixels;
+    let output_h = tile_height * tiling_h + 2 * margin_pixels;
+    let output_w = tile_width * tiling_w + 2 * margin_pixels;
 
-    let output_h = (crop_height_usize * margin_pixels) * tiling_h + 2 * margin_pixels;
-    let output_w = (crop_width_usize * margin_pixels) * tiling_w + 2 * margin_pixels;
+    // Process crops in batches by position type (corner, edge, center)
+    let mut result_pieces = Vec::new();
 
-    let mut reconstructed = vec![0.0; output_h * output_w * channels_usize];
+    // Process each tile position
+    for tile_y in 0..tiling_h {
+        let mut row_pieces = Vec::new();
 
-    for i in 0..range_usize {
-        let tile_y = i / tiling_w;
-        let tile_x = i % tiling_w;
+        for tile_x in 0..tiling_w {
+            let i = tile_y * tiling_w + tile_x;
 
-        // Determine which part of the crop to copy
-        let x_start = if tile_x == 0 { 0 } else { margin_pixels };
-        let x_end = if tile_x == tiling_w - 1 {
-            crop_width_usize
-        } else {
-            (crop_width_usize - margin_pixels)
-        };
+            // Get the current crop
+            let current_crop = crops.slice((i..i + 1, .., .., ..)).reshape((
+                crop_height_usize,
+                crop_width_usize,
+                channels_usize,
+            ));
 
-        let y_start = if tile_y == 0 { 0 } else { margin_pixels };
-        let y_end = if tile_y == tiling_h - 1 {
-            crop_height_usize
-        } else {
-            (crop_height_usize - margin_pixels)
-        };
+            // Determine crop boundaries
+            let x_start = if tile_x == 0 { 0 } else { margin_pixels };
+            let x_end = if tile_x == tiling_w - 1 {
+                crop_width_usize
+            } else {
+                crop_width_usize - margin_pixels
+            };
 
-        // Calculate where this piece belongs in the output
-        let out_x = tile_x * (crop_width_usize - 2 * margin_pixels);
-        let out_y = tile_y * (crop_height_usize - 2 * margin_pixels);
-        // Copy the relevant region into the output
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                for c in 0..channels.to_usize().unwrap() {
-                    let in_idx = (y * crop_width_usize + x) * channels_usize + c;
-                    let out_x_global = out_x + x - x_start;
-                    let out_y_global = out_y + y - y_start;
-                    let out_idx = (out_y_global * output_w + out_x_global) * channels_usize + c;
-                    if out_idx < reconstructed.len() && in_idx < crops_data.len() {
-                        reconstructed[out_idx] = crops_data[in_idx];
-                    }
-                }
-            }
+            let y_start = if tile_y == 0 { 0 } else { margin_pixels };
+            let y_end = if tile_y == tiling_h - 1 {
+                crop_height_usize
+            } else {
+                crop_height_usize - margin_pixels
+            };
+
+            // Extract the piece
+            let piece = current_crop.slice((y_start..y_end, x_start..x_end, ..));
+            row_pieces.push(piece);
         }
+
+        // Concatenate all pieces in this row horizontally
+        let mut row_tensor = row_pieces[0];
+        for piece in row_pieces.into_iter().skip(1) {
+            row_tensor = row_tensor.concat_along(piece, 1); // Concat along width
+        }
+        result_pieces.push(row_tensor);
     }
-    (reconstructed, (output_h, output_w, channels_usize))
+
+    // Concatenate all rows vertically
+    let mut final_result = result_pieces[0];
+    for row_tensor in result_pieces.into_iter().skip(1) {
+        final_result = final_result.concat_along(row_tensor, 0); // Concat along height
+    }
+
+    final_result
 }
 
 pub struct VisionProjector {

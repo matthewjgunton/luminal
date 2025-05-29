@@ -3,15 +3,14 @@ use luminal_nn::*;
 
 use crate::image_model::{self, *};
 use crate::text_model::{self, *};
-
-pub const BOS_ID: f32 = 50256.0;
+use crate::BOS_ID;
 
 pub struct Moondream {
-    vision_encoder: VisionEncoder,
-    text_encoder: Embedding,
-    text_decoder: Vec<TextBlock>,
-    vision_projector: VisionProjector,
-    lm_head: LmHead,
+    pub vision_encoder: VisionEncoder,
+    pub text_encoder: Embedding,
+    pub text_decoder: Vec<TextBlock>,
+    pub vision_projector: VisionProjector,
+    pub lm_head: LmHead,
 }
 impl Moondream {
     pub fn new(cx: &mut Graph) -> Self {
@@ -27,69 +26,76 @@ impl Moondream {
 
 pub type KVCache = (GraphTensor, GraphTensor);
 
-// this may need to be prefill rather than forwards...
-// most important part of this is to fill the KV cache with the images + pos_ids
-impl Module<(GraphTensor, GraphTensor, &[KVCache], &mut Graph, bool)> for Moondream {
-    // Args: (image_tensor, token_ids, kv_cache[])
+// this is now akin to the _generator
+impl Module<(GraphTensor, &[KVCache], usize, usize)> for Moondream {
     type Output = (GraphTensor, Vec<KVCache>);
     fn forward(
         &self,
-        (img, toks, cache, cx, is_prefill): (
-            GraphTensor,
-            GraphTensor,
-            &[KVCache],
-            &mut Graph,
-            bool,
-        ),
+        (toks, cache, pos_start, pos_end): (GraphTensor, &[KVCache], usize, usize),
     ) -> Self::Output {
-        img.diff("./prompts/image.bin", ATOL, RTOL);
+        let mut prompt = self.text_encoder.forward(toks);
 
-        //IMAGE MODEL calls
-        //(1) prepare_crops >> this is input into the model
-        //(2) _vis_enc >> this is done below
-        let x = self.vision_encoder.forward(img);
-        x.diff("./bins/vis_enc_outputs.bin", ATOL, RTOL);
-
-        //(3) reconstruct
-        let global_features = x
-            .slice((..Expression::from(0), .., ..))
-            .reshape((VIS_NUM_PATCHES, VIS_DIM)) // unsqueeze effectively
-            .contiguous();
-        let (reconstructed, (output_h, output_w, channels_usize)) =
-            image_model::reconstruct_from_crops(x);
-
-        let normalized = cx
-            .tensor((output_h, output_w, channels_usize))
-            .set(reconstructed);
-
-        //(4)_vis_proj [pending]
-        let img_emb = self.vision_projector.forward((global_features, normalized)); // (expecting (729, 2048)
-
-        //(5) text encoding embeddings
-        let bos_tensor = cx.tensor((1, 1)).set(vec![BOS_ID]); // (expecting 1,1,2048)
-        self.text_encoder.forward(bos_tensor);
-        let mut prompt = img_emb
-            .reshape((1, VIS_NUM_PATCHES, TXT_DIM))
-            .contiguous()
-            .concat_along(bos_tensor, 1)
-            .contiguous();
-
-        let (b, t, c) = prompt.dims3();
-        let mut pos_ids: Vec<usize> = (0..t.to_usize().unwrap()).collect(); // t should be 730 here
-
-        //(6) text decoder
+        //text decoder
+        let mut new_caches = vec![];
+        let mut new_cache: KVCache;
         for layer in 0..self.text_decoder.len() {
-            let (y, cache) = self.text_decoder[layer].forward((prompt, cache[0], &pos_ids));
+            let (y, new_cache) =
+                self.text_decoder[layer].forward((prompt, cache[layer], pos_start, pos_end));
+            new_caches.push(new_cache);
             prompt = y;
         }
-        // ---- at this stage it is ready to begin the decoder loop
 
-        // (7) lm_head:
+        // lm_head:
+        let logits = self.lm_head.forward(prompt);
 
-        let new = Vec::with_capacity(TXT_N_LAYERS);
-
-        (prompt, new)
+        (logits, new_caches)
     }
+}
+
+pub fn _run_vision_encoder(
+    moondream: &Moondream,
+    img: GraphTensor,
+    cx: &mut Graph,
+    cache: &Vec<KVCache>,
+) -> Vec<KVCache> {
+    let x = moondream.vision_encoder.forward(img);
+
+    let (a, _, _) = x.dims3();
+
+    //(3) reconstruct
+    let global_features = x
+        .slice((..Expression::from(0), .., ..))
+        .reshape((VIS_NUM_PATCHES, VIS_DIM)) // unsqueeze effectively
+        .contiguous();
+    let local_features = x
+        .slice((Expression::from(1).., .., ..))
+        .reshape((a - 1, VIS_N_LAYERS, VIS_N_LAYERS, VIS_DIM)) // unsqueeze effectively
+        .contiguous();
+    let reconstructed = image_model::reconstruct_from_crops(local_features);
+
+    //(4)_vis_proj [pending]
+    let img_emb = moondream
+        .vision_projector
+        .forward((global_features, reconstructed)); // (expecting (729, 2048)
+
+    //(5) text encoding embeddings
+    let bos_tensor = cx.tensor((1, 1)).set(vec![BOS_ID]); // (expecting 1,1,2048)
+    moondream.text_encoder.forward(bos_tensor);
+    let mut prompt = img_emb
+        .reshape((1, VIS_NUM_PATCHES, TXT_DIM))
+        .contiguous()
+        .concat_along(bos_tensor, 1)
+        .contiguous();
+    let (_, t, _) = prompt.dims3();
+
+    let mut new_caches = vec![];
+    for layer in 0..moondream.text_decoder.len() {
+        let (y, new_cache) =
+            moondream.text_decoder[layer].forward((prompt, cache[layer], 0, t.to_usize().unwrap()));
+        new_caches.push(new_cache);
+        prompt = y;
+    }
+    (new_caches)
 }
 
 ///////////////////

@@ -15,7 +15,7 @@ pub fn load_image_binary_with_path(img: &GraphTensor, graph: &mut Graph, file_pa
         .and_then(|op| op.as_any_mut().downcast_mut::<Function>())
     {
         loading_node.1 = Box::new(move |_| {
-            let mut file =
+            let mut file: File =
                 File::open(&path).unwrap_or_else(|_| panic!("Failed to open file: {}", path));
 
             let mut buffer = Vec::new();
