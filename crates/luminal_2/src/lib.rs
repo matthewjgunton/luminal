@@ -4,9 +4,8 @@ pub mod run;
 pub mod translate;
 pub mod utils;
 
-mod code_tests;
 #[cfg(test)]
-mod tests;
+mod code_tests;
 
 use luminal::prelude::*;
 use std::{collections::HashMap, fmt::Debug};
