@@ -4,6 +4,7 @@ pub mod run;
 pub mod translate;
 pub mod utils;
 
+mod code_tests;
 #[cfg(test)]
 mod tests;
 

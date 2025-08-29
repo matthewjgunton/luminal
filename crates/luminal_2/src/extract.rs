@@ -714,7 +714,7 @@ pub fn make_test_inputs(
 mod tests {
     use super::*;
     use crate::{
-        translate::{MetaGraph, SubGraph, translate_graph_meta},
+        translate::{MetaGraph, SubGraph, translate_graph},
         utils::{build_search_space, display_graph},
     };
     use luminal::{graph::Graph, prelude::petgraph::algo::is_cyclic_directed};
@@ -734,7 +734,7 @@ mod tests {
         let d = c * a;
         let _e = d.sum(0).retrieve();
 
-        let (meta_graph, _global_map, _inits) = translate_graph_meta(&cx);
+        let (meta_graph, _global_map, _inits) = translate_graph(&cx);
         let meta_node = meta_graph
             .node_indices()
             .next()

@@ -1544,7 +1544,7 @@ mod tests {
         assert_eq!(MAX_GRID_X, 2147483647);
         assert_eq!(MAX_GRID_YZ, 65535);
         assert_eq!(GRID_DIMS, 2);
-        assert_eq!(THREADBLOCK_DIMS, 1);
+        assert_eq!(THREADBLOCK_DIMS, 2);
     }
 
     #[test]
